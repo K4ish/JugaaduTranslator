@@ -3,16 +3,22 @@
 import streamlit as st
 import json
 import os
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import speech_recognition as sr
-import geocoder
-from datetime import datetime
+import openai
+from gtts import gTTS
+from streamlit_geolocation import streamlit_geolocation
+from audio_recorder_streamlit import audio_recorder
+import datetime
 
 # --- Configuration & Setup ---
 DB_FILE = "phrases_db.json"
-CREDS_FILE = "google_sheets_creds.json"  # You'll need to create this file with your Google API credentials
-SHEET_NAME = "Jugaadu_Translator_Phrases"  # Name of your Google Sheet
+CONTRIBUTIONS_FILE = "contributions_db.json"
+AUDIO_DIR = "audio_contributions"
+
+# --- OpenAI API Key Setup ---
+# For security, it's recommended to use Streamlit's secrets management
+# https://docs.streamlit.io/library/advanced-features/secrets-management
+# For local development, you can set the environment variable.
+openai.api_key = os.environ.get("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY"))
 
 st.set_page_config(
     page_title="Jugaadu Translator",
@@ -21,158 +27,105 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Google Sheets Integration ---
-
-def get_google_sheet():
-    """Authenticates and returns the Google Sheet."""
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", 
-                "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, scope)
-        client = gspread.authorize(creds)
-        sheet = client.open(SHEET_NAME).sheet1
-        return sheet
-    except Exception as e:
-        st.error(f"Failed to connect to Google Sheets: {e}")
-        return None
-
-def sync_with_google_sheets(local_db):
-    """Syncs the local database with Google Sheets."""
-    sheet = get_google_sheet()
-    if sheet:
-        try:
-            # Get all records from the sheet
-            records = sheet.get_all_records()
-            sheet_db = {row['Local Phrase'].lower(): row['English Translation'] for row in records}
-            
-            # Update local database with any new entries from the sheet
-            updated = False
-            for phrase, translation in sheet_db.items():
-                if phrase not in local_db:
-                    local_db[phrase] = translation
-                    updated = True
-            
-            # If there were updates, save the local file
-            if updated:
-                save_database(local_db)
-            
-            return True
-        except Exception as e:
-            st.error(f"Error syncing with Google Sheets: {e}")
-            return False
-    return False
-
-def add_to_google_sheets(local_phrase, english_phrase, location=None):
-    """Adds a new phrase to Google Sheets."""
-    sheet = get_google_sheet()
-    if sheet:
-        try:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            location_str = f"{location['lat']}, {location['lng']}" if location else "Unknown"
-            sheet.append_row([local_phrase, english_phrase, timestamp, location_str])
-            return True
-        except Exception as e:
-            st.error(f"Failed to add to Google Sheets: {e}")
-            return False
-    return False
-
-# --- Location Services ---
-
-def get_user_location():
-    """Attempts to get the user's approximate location."""
-    try:
-        g = geocoder.ip('me')
-        if g.ok:
-            return {'lat': g.lat, 'lng': g.lng, 'city': g.city, 'country': g.country}
-        return None
-    except Exception as e:
-        st.warning(f"Could not determine location: {e}")
-        return None
-
-# --- Speech Recognition ---
-
-def recognize_speech():
-    """Uses microphone input to recognize speech."""
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        st.info("Listening... Speak now!")
-        audio = r.listen(source)
-    
-    try:
-        text = r.recognize_google(audio)
-        return text
-    except sr.UnknownValueError:
-        st.error("Could not understand audio")
-        return None
-    except sr.RequestError as e:
-        st.error(f"Speech recognition error; {e}")
-        return None
+# --- Create directory for audio files if it doesn't exist ---
+if not os.path.exists(AUDIO_DIR):
+    os.makedirs(AUDIO_DIR)
 
 # --- Data Handling Functions ---
 
-def load_database():
-    """Loads the phrase database from the JSON file."""
-    if not os.path.exists(DB_FILE):
-        initial_data = {
-            "kaisa hai?": "How are you?",
-            "sab theek hai": "Everything is fine.",
-            "tuition laga lo": "Get a tutor / Start tuition classes.",
-            "timepass kar raha hoon": "I'm just passing time.",
-            "panga mat le": "Don't mess with me.",
-            "oye!": "Hey!",
-            "chalega": "It will work / That's acceptable."
-        }
-        with open(DB_FILE, 'w', encoding='utf-8') as f:
-            json.dump(initial_data, f, ensure_ascii=False, indent=4)
-        return initial_data
-    
+def load_database(file_path):
+    """Loads a database from a JSON file."""
+    if not os.path.exists(file_path):
+        return {}
     try:
-        with open(DB_FILE, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, FileNotFoundError):
         return {}
 
-def save_database(data):
-    """Saves the updated phrase database to the JSON file."""
-    with open(DB_FILE, 'w', encoding='utf-8') as f:
+def save_database(data, file_path):
+    """Saves updated data to a JSON file."""
+    with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
+
+# --- AI and Utility Functions ---
+
+def transcribe_audio(audio_bytes):
+    """Transcribes audio using OpenAI's Whisper model."""
+    if not openai.api_key:
+        st.error("OpenAI API key is not set. Please configure it.")
+        return None
+    try:
+        # Save the audio bytes to a temporary file
+        temp_audio_path = os.path.join(AUDIO_DIR, "temp_recording.wav")
+        with open(temp_audio_path, "wb") as f:
+            f.write(audio_bytes)
+        
+        with open(temp_audio_path, "rb") as audio_file:
+            transcript = openai.Audio.transcribe("whisper-1", audio_file)
+        
+        os.remove(temp_audio_path) # Clean up the temporary file
+        return transcript['text']
+    except Exception as e:
+        st.error(f"Error in transcription: {e}")
+        return None
+
+def summarize_text_for_title_desc(text):
+    """Generates a title and description for a text using OpenAI's GPT model."""
+    if not openai.api_key:
+        st.error("OpenAI API key is not set. Please configure it.")
+        return None, None
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that creates a short, catchy title and a brief, one-sentence description for the given text."},
+                {"role": "user", "content": f"Generate a title and a one-sentence description for the following text:\n\n{text}"}
+            ]
+        )
+        summary = response.choices[0].message['content'].strip()
+        # Simple parsing of the response
+        parts = summary.split("\n")
+        title = parts[0].replace("Title: ", "").strip()
+        description = parts[1].replace("Description: ", "").strip() if len(parts) > 1 else ""
+        return title, description
+    except Exception as e:
+        st.error(f"Error in summarization: {e}")
+        return None, None
+
+def text_to_speech(text):
+    """Converts text to speech using gTTS and returns audio bytes."""
+    try:
+        tts = gTTS(text=text, lang='en', slow=False)
+        audio_fp = "temp_tts.mp3"
+        tts.save(audio_fp)
+        with open(audio_fp, 'rb') as f:
+            audio_bytes = f.read()
+        os.remove(audio_fp)
+        return audio_bytes
+    except Exception as e:
+        st.error(f"Error in text-to-speech: {e}")
+        return None
 
 # --- Main Application ---
 
 # Load the data at the start
-phrases_db = load_database()
-
-# Attempt to sync with Google Sheets on startup
-if st.sidebar.checkbox("Enable Google Sheets Sync", True):
-    if sync_with_google_sheets(phrases_db):
-        st.sidebar.success("Synced with Google Sheets!")
-    else:
-        st.sidebar.warning("Using local database only")
+phrases_db = load_database(DB_FILE)
+contributions_db = load_database(CONTRIBUTIONS_FILE)
 
 # --- UI Layout ---
 
 st.title("💡 Jugaadu Local Phrase Translator")
 st.markdown("""
-A community-built translator to bridge communication gaps. 
-Now with voice input and cloud sync!
+A community-built translator to bridge communication gaps.
 """)
 
 # --- Sidebar for Mode Selection ---
 st.sidebar.header("What do you want to do?")
 app_mode = st.sidebar.radio(
     "Choose a mode:",
-    ('Translate a Phrase', 'Contribute a New Phrase')
+    ('Translate a Phrase', 'Contribute a New Phrase', 'Record and Contribute')
 )
-
-# --- Location Access ---
-location_access = st.sidebar.checkbox("Share my location (helps improve regional translations)")
-user_location = None
-if location_access:
-    user_location = get_user_location()
-    if user_location:
-        st.sidebar.success(f"Location: {user_location.get('city', 'Unknown')}, {user_location.get('country', 'Unknown')}")
-    else:
-        st.sidebar.warning("Could not determine location")
 
 # --- Mode 1: Translation ---
 if app_mode == 'Translate a Phrase':
@@ -193,29 +146,21 @@ if app_mode == 'Translate a Phrase':
         source_db = english_to_local_db
         not_found_message = "Sorry, no local equivalent found. Feel free to contribute one!"
 
-    # Voice Input Button
-    if st.button("🎤 Use Voice Input", key="voice_input"):
-        user_input = recognize_speech()
-    else:
-        user_input = ""
-
-    text_input = st.text_input(input_label, value=user_input if user_input else "", placeholder="Type or speak a phrase here...")
+    user_input = st.text_input(input_label, placeholder="Type a phrase here...")
 
     if st.button("Translate", use_container_width=True, type="primary"):
-        if text_input:
-            query = text_input.strip().lower()
+        if user_input:
+            query = user_input.strip().lower()
             result = source_db.get(query, not_found_message)
             
             st.subheader("Translation:")
             st.success(f"**{result}**")
-            
-            # Log the translation request to Google Sheets
-            if location_access and user_location:
-                add_to_google_sheets(
-                    text_input if direction == 'Local Dialect → Standard English' else result,
-                    result if direction == 'Local Dialect → Standard English' else text_input,
-                    user_location
-                )
+
+            if result != not_found_message:
+                st.subheader("Listen to the Translation:")
+                audio_bytes = text_to_speech(result)
+                if audio_bytes:
+                    st.audio(audio_bytes, format="audio/mp3")
         else:
             st.warning("Please enter a phrase to translate.")
 
@@ -235,35 +180,92 @@ elif app_mode == 'Contribute a New Phrase':
                 local_key = local_phrase.strip().lower()
                 english_value = standard_english_phrase.strip()
                 
-                # Update local database
                 phrases_db[local_key] = english_value
-                save_database(phrases_db)
-                
-                # Add to Google Sheets if enabled
-                if location_access:
-                    add_to_google_sheets(local_phrase, english_value, user_location)
+                save_database(phrases_db, DB_FILE)
                 
                 st.success(f"Thank you! '{local_phrase}' has been added to the translator.")
                 st.balloons()
             else:
                 st.error("Please fill in both fields before submitting.")
 
-# --- Displaying the Raw Data ---
+# --- Mode 3: Record and Contribute ---
+elif app_mode == 'Record and Contribute':
+    st.header("🎤 Record a Phrase")
+    st.info("Contribute by recording a phrase. We'll transcribe it and generate a title and description.", icon="🗣️")
+
+    audio_bytes = audio_recorder(
+        text="Click to Record",
+        recording_color="#e8b62c",
+        neutral_color="#6a6a6a",
+        icon_name="microphone",
+        pause_threshold=2.0,
+    )
+
+    if audio_bytes:
+        st.audio(audio_bytes, format="audio/wav")
+
+        if st.button("Process Recording", use_container_width=True, type="primary"):
+            with st.spinner("Transcribing audio..."):
+                transcribed_text = transcribe_audio(audio_bytes)
+
+            if transcribed_text:
+                st.subheader("Transcription:")
+                st.write(transcribed_text)
+
+                with st.spinner("Generating title and description..."):
+                    title, description = summarize_text_for_title_desc(transcribed_text)
+
+                if title and description:
+                    st.subheader("Generated Title:")
+                    st.write(title)
+                    st.subheader("Generated Description:")
+                    st.write(description)
+                    
+                    st.subheader("Get Geolocation")
+                    location = streamlit_geolocation()
+                    if location and location.get('latitude'):
+                        st.success(f"Location captured: Latitude {location['latitude']}, Longitude {location['longitude']}")
+
+                        if st.button("Save Contribution", use_container_width=True):
+                            # Save the audio file
+                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            audio_filename = f"{timestamp}.wav"
+                            audio_filepath = os.path.join(AUDIO_DIR, audio_filename)
+                            with open(audio_filepath, "wb") as f:
+                                f.write(audio_bytes)
+
+                            # Save metadata
+                            contribution_id = f"contribution_{len(contributions_db) + 1}"
+                            contributions_db[contribution_id] = {
+                                "title": title,
+                                "description": description,
+                                "transcribed_text": transcribed_text,
+                                "geolocation": {
+                                    "latitude": location['latitude'],
+                                    "longitude": location['longitude']
+                                },
+                                "audio_file": audio_filepath,
+                                "timestamp": timestamp
+                            }
+                            save_database(contributions_db, CONTRIBUTIONS_FILE)
+                            st.success("Your contribution has been saved!")
+                            st.balloons()
+                    else:
+                        st.warning("Could not retrieve location. Please allow location access in your browser.")
+                else:
+                    st.error("Could not generate a title and description.")
+            else:
+                st.error("Transcription failed.")
+
+# --- Displaying the Raw Data (Optional) ---
 with st.expander("🧐 See all known phrases (the current database)"):
     if phrases_db:
         st.json(phrases_db)
     else:
-        st.write("The database is currently empty. Contribute a phrase to get started!")
+        st.write("The phrase database is currently empty. Contribute a phrase to get started!")
 
-# --- Google Sheets Viewer ---
-if st.sidebar.checkbox("Show Google Sheets Data", False):
-    st.sidebar.info("This shows the data stored in Google Sheets")
-    sheet = get_google_sheet()
-    if sheet:
-        try:
-            data = sheet.get_all_records()
-            st.sidebar.write(f"Total entries in Google Sheets: {len(data)}")
-            if data:
-                st.sidebar.dataframe(data)
-        except Exception as e:
-            st.sidebar.error(f"Error reading Google Sheets: {e}")
+with st.expander("🎙️ See all voice contributions"):
+    if contributions_db:
+        st.json(contributions_db)
+    else:
+        st.write("The voice contribution database is currently empty. Record a contribution to get started!")
