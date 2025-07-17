@@ -24,7 +24,7 @@ st.set_page_config(
 # --- OpenAI API Key Setup ---
 # Recommended: Use Streamlit's secrets management for deployment
 # https://docs.streamlit.io/library/advanced-features/secrets-management
-openai.api_key = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY"))
+openai.api_key = st.secrets.get("AIzaSyAZM8h1CMOi2OApWvxuJ-lIaSVCz2Fxb3c", os.environ.get("OPENAI_API_KEY"))
 
 # --- Create directories if they don't exist ---
 os.makedirs(TRANSLATION_AUDIO_DIR, exist_ok=True)
