@@ -1,26 +1,33 @@
-# File: jugaadu_translator.py
-
 import streamlit as st
 import json
 import os
+import geocoder
+import speech_recognition as sr
+from pydub import AudioSegment
+from io import BytesIO
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# --- Configuration & Setup ---
+# File & Google Sheets config
 DB_FILE = "phrases_db.json"
+GSHEET_CREDS = "your_credentials.json"  # Replace with your JSON path
+GSHEET_NAME = "Jugaadu_Translations"   # Replace with your Sheet name
 
-st.set_page_config(
-    page_title="Jugaadu Translator",
-    page_icon="💡",
-    layout="centered",
-    initial_sidebar_state="expanded"
-)
+# --- Google Sheets Helper ---
+def append_to_gsheet(local, english, location):
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(GSHEET_CREDS, scope)
+    client = gspread.authorize(creds)
+    sheet = client.open(GSHEET_NAME).sheet1
+    sheet.append_row([local, english, location])
 
-# --- Data Handling Functions (for offline storage) ---
-
+# --- DB Load/Save ---
 def load_database():
-    """Loads the phrase database from the JSON file."""
     if not os.path.exists(DB_FILE):
-        # If the file doesn't exist, create it with some initial examples
-        initial_data = {
+        initial = {
             "kaisa hai?": "How are you?",
             "sab theek hai": "Everything is fine.",
             "tuition laga lo": "Get a tutor / Start tuition classes.",
@@ -30,109 +37,100 @@ def load_database():
             "chalega": "It will work / That's acceptable."
         }
         with open(DB_FILE, 'w', encoding='utf-8') as f:
-            json.dump(initial_data, f, ensure_ascii=False, indent=4)
-        return initial_data
-    
+            json.dump(initial, f, ensure_ascii=False, indent=4)
+        return initial
     try:
         with open(DB_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, FileNotFoundError):
-        # If file is empty or corrupted, return an empty dictionary
         return {}
 
-
 def save_database(data):
-    """Saves the updated phrase database to the JSON file."""
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# --- Main Application ---
-
-# Load the data at the start
+# --- App Setup ---
+st.set_page_config(page_title="Jugaadu Translator", page_icon="💡", layout="centered")
 phrases_db = load_database()
 
-# --- UI Layout ---
-
-st.title("💡 Jugaadu Local Phrase Translator")
-st.markdown("""
-A community-built translator to bridge communication gaps. 
-Works entirely offline!
-""")
-
-# --- Sidebar for Mode Selection ---
+# Sidebar
 st.sidebar.header("What do you want to do?")
-app_mode = st.sidebar.radio(
-    "Choose a mode:",
-    ('Translate a Phrase', 'Contribute a New Phrase')
-)
+app_mode = st.sidebar.radio("Choose a mode:", ('Translate a Phrase', 'Contribute a New Phrase'))
 
-# --- Mode 1: Translation ---
+# --- Translation Mode ---
 if app_mode == 'Translate a Phrase':
-    st.header("🔄 Translate")
-
+    st.title("🔄 Translate")
     direction = st.radio(
         "Select translation direction:",
         ('Local Dialect → Standard English', 'Standard English → Local Dialect')
     )
-
-    if direction == 'Local Dialect → Standard English':
-        input_label = "Enter the local phrase you want to translate:"
-        # The keys of our database are the local phrases
+    if direction.startswith('Local'):
+        input_label = "Enter the local phrase to translate:"
         source_db = phrases_db
-        not_found_message = "Sorry, I don't know that one yet! You can add it in the 'Contribute' mode."
-    else: # English to Local
-        input_label = "Enter the Standard English phrase you want to translate:"
-        # We need to create a reverse dictionary for this direction
+        not_found_message = "Sorry, I don't know that one yet! Add it in 'Contribute' mode."
+    else:
+        input_label = "Enter the Standard English phrase to translate:"
         english_to_local_db = {v.lower(): k for k, v in phrases_db.items()}
         source_db = english_to_local_db
         not_found_message = "Sorry, no local equivalent found. Feel free to contribute one!"
-
     user_input = st.text_input(input_label, placeholder="Type a phrase here...")
 
     if st.button("Translate", use_container_width=True, type="primary"):
         if user_input:
-            # Standardize input for better matching
-            query = user_input.strip().lower()
-            
-            # Find the translation
-            result = source_db.get(query, not_found_message)
-            
+            result = source_db.get(user_input.strip().lower(), not_found_message)
             st.subheader("Translation:")
             st.success(f"**{result}**")
         else:
             st.warning("Please enter a phrase to translate.")
 
-# --- Mode 2: Crowdsourcing / Contribution ---
-elif app_mode == 'Contribute a New Phrase':
-    st.header("✍️ Add Your Own Phrase")
+# --- Contribution Mode ---
+else:
+    st.title("✍️ Add Your Own Phrase")
     st.info("Help us grow! Your contributions make the translator smarter for everyone.", icon="🙏")
 
-    with st.form("contribution_form"):
-        local_phrase = st.text_input("Enter the Local/Colloquial Phrase:")
+    # 1. Detect location via IP
+    loc = geocoder.ip('me')
+    user_location = f"{loc.city}, {loc.country}" if loc.city else "Unknown"
+
+    # 2. Provide optional audio input
+    st.subheader("🎤 Optional: Record your voice for input")
+    audio_file = st.file_uploader("Upload an audio clip (wav/mp3/m4a)", type=["wav", "mp3", "m4a"])
+    transcript = ""
+    if audio_file:
+        st.audio(audio_file)
+        audio = AudioSegment.from_file(audio_file).set_channels(1).set_frame_rate(16000)
+        with BytesIO() as buf:
+            audio.export(buf, format="wav")
+            buf.seek(0)
+            recog = sr.Recognizer()
+            with sr.AudioFile(buf) as source:
+                audio_data = recog.record(source)
+                try:
+                    transcript = recog.recognize_google(audio_data)
+                    st.success(f"Recognized Text: {transcript}")
+                except sr.UnknownValueError:
+                    st.error("Could not understand the audio.")
+                except sr.RequestError:
+                    st.error("Speech recognition service error.")
+
+    # Contribution form
+    with st.form("contrib_form"):
+        local_phrase = st.text_input("Enter the Local/Colloquial Phrase:", value=transcript)
         standard_english_phrase = st.text_input("Enter its Standard English Equivalent:")
-        
-        submitted = st.form_submit_button("Submit Contribution", use_container_width=True)
+        submitted = st.form_submit_button("Submit Contribution")
 
         if submitted:
             if local_phrase and standard_english_phrase:
-                # Standardize inputs before saving
-                local_key = local_phrase.strip().lower()
-                english_value = standard_english_phrase.strip()
-                
-                # Update the database in memory
-                phrases_db[local_key] = english_value
-                
-                # Save the updated database to the file
+                key = local_phrase.strip().lower()
+                val = standard_english_phrase.strip()
+                phrases_db[key] = val
                 save_database(phrases_db)
-                
-                st.success(f"Thank you! '{local_phrase}' has been added to the translator.")
+                append_to_gsheet(key, val, user_location)
+                st.success(f"Thank you! '{local_phrase}' has been added.")
                 st.balloons()
             else:
                 st.error("Please fill in both fields before submitting.")
 
-# --- Displaying the Raw Data (Optional) ---
+# --- View Database ---
 with st.expander("🧐 See all known phrases (the current database)"):
-    if phrases_db:
-        st.json(phrases_db)
-    else:
-        st.write("The database is currently empty. Contribute a phrase to get started!")
+    st.json(phrases_db)
