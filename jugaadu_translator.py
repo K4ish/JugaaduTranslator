@@ -11,14 +11,8 @@ import datetime
 
 # --- Configuration & Setup ---
 DB_FILE = "phrases_db.json"
-CONTRIBUTIONS_FILE = "contributions_db.json"
-AUDIO_DIR = "audio_contributions"
-
-# --- OpenAI API Key Setup ---
-# For security, it's recommended to use Streamlit's secrets management
-# https://docs.streamlit.io/library/advanced-features/secrets-management
-# For local development, you can set the environment variable.
-openai.api_key = os.environ.get("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY"))
+TRANSLATION_LOG_FILE = "translation_log.json"
+TRANSLATION_AUDIO_DIR = "audio_translations" # For audio from the translate page
 
 st.set_page_config(
     page_title="Jugaadu Translator",
@@ -27,9 +21,23 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Create directory for audio files if it doesn't exist ---
-if not os.path.exists(AUDIO_DIR):
-    os.makedirs(AUDIO_DIR)
+# --- OpenAI API Key Setup ---
+# Recommended: Use Streamlit's secrets management for deployment
+# https://docs.streamlit.io/library/advanced-features/secrets-management
+openai.api_key = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY"))
+
+# --- Create directories if they don't exist ---
+os.makedirs(TRANSLATION_AUDIO_DIR, exist_ok=True)
+
+# --- Initialize Session State ---
+# This helps manage state between user interactions like recording and translating
+if 'text_input' not in st.session_state:
+    st.session_state.text_input = ""
+if 'is_voice_input' not in st.session_state:
+    st.session_state.is_voice_input = False
+if 'audio_bytes' not in st.session_state:
+    st.session_state.audio_bytes = None
+
 
 # --- Data Handling Functions ---
 
@@ -56,45 +64,39 @@ def transcribe_audio(audio_bytes):
         st.error("OpenAI API key is not set. Please configure it.")
         return None
     try:
-        # Save the audio bytes to a temporary file
-        temp_audio_path = os.path.join(AUDIO_DIR, "temp_recording.wav")
+        temp_audio_path = os.path.join(TRANSLATION_AUDIO_DIR, "temp_recording.wav")
         with open(temp_audio_path, "wb") as f:
             f.write(audio_bytes)
-        
         with open(temp_audio_path, "rb") as audio_file:
             transcript = openai.Audio.transcribe("whisper-1", audio_file)
-        
-        os.remove(temp_audio_path) # Clean up the temporary file
+        os.remove(temp_audio_path)
         return transcript['text']
     except Exception as e:
         st.error(f"Error in transcription: {e}")
         return None
 
-def summarize_text_for_title_desc(text):
+def generate_title_desc(text):
     """Generates a title and description for a text using OpenAI's GPT model."""
     if not openai.api_key:
-        st.error("OpenAI API key is not set. Please configure it.")
-        return None, None
+        return "N/A", "N/A"
     try:
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that creates a short, catchy title and a brief, one-sentence description for the given text."},
-                {"role": "user", "content": f"Generate a title and a one-sentence description for the following text:\n\n{text}"}
+                {"role": "system", "content": "You are an assistant that creates a short title and a one-sentence description for the given text. Format it as 'Title: [Your Title]\\nDescription: [Your Description]'."},
+                {"role": "user", "content": text}
             ]
         )
         summary = response.choices[0].message['content'].strip()
-        # Simple parsing of the response
         parts = summary.split("\n")
-        title = parts[0].replace("Title: ", "").strip()
-        description = parts[1].replace("Description: ", "").strip() if len(parts) > 1 else ""
+        title = parts[0].replace("Title:", "").strip()
+        description = parts[1].replace("Description:", "").strip() if len(parts) > 1 else ""
         return title, description
-    except Exception as e:
-        st.error(f"Error in summarization: {e}")
-        return None, None
+    except Exception:
+        return "Summary Error", "Could not generate summary."
 
 def text_to_speech(text):
-    """Converts text to speech using gTTS and returns audio bytes."""
+    """Converts text to speech and returns audio bytes."""
     try:
         tts = gTTS(text=text, lang='en', slow=False)
         audio_fp = "temp_tts.mp3"
@@ -107,24 +109,49 @@ def text_to_speech(text):
         st.error(f"Error in text-to-speech: {e}")
         return None
 
+def log_voice_translation(audio_bytes, original_text, translated_text, geolocation):
+    """Saves the audio file and logs the translation details."""
+    st.info("Saving translation log with geolocation and audio...")
+
+    log_db = load_database(TRANSLATION_LOG_FILE)
+    
+    # Generate metadata
+    title, description = generate_title_desc(original_text)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_id = f"translation_{timestamp}"
+    audio_filename = f"{log_id}.wav"
+    audio_filepath = os.path.join(TRANSLATION_AUDIO_DIR, audio_filename)
+    
+    # Save the audio file
+    with open(audio_filepath, "wb") as f:
+        f.write(audio_bytes)
+        
+    # Create the log entry
+    log_db[log_id] = {
+        "title": title,
+        "description": description,
+        "original_transcription": original_text,
+        "translated_text": translated_text,
+        "geolocation": geolocation,
+        "audio_file": audio_filepath,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+    
+    # Save the updated log database
+    save_database(log_db, TRANSLATION_LOG_FILE)
+    st.success("Translation log saved!")
+
 # --- Main Application ---
 
-# Load the data at the start
 phrases_db = load_database(DB_FILE)
-contributions_db = load_database(CONTRIBUTIONS_FILE)
-
-# --- UI Layout ---
 
 st.title("💡 Jugaadu Local Phrase Translator")
-st.markdown("""
-A community-built translator to bridge communication gaps.
-""")
+st.markdown("A community-built translator to bridge communication gaps.")
 
-# --- Sidebar for Mode Selection ---
 st.sidebar.header("What do you want to do?")
 app_mode = st.sidebar.radio(
     "Choose a mode:",
-    ('Translate a Phrase', 'Contribute a New Phrase', 'Record and Contribute')
+    ('Translate a Phrase', 'Contribute a New Phrase')
 )
 
 # --- Mode 1: Translation ---
@@ -133,36 +160,88 @@ if app_mode == 'Translate a Phrase':
 
     direction = st.radio(
         "Select translation direction:",
-        ('Local Dialect → Standard English', 'Standard English → Local Dialect')
+        ('Local Dialect → Standard English', 'Standard English → Local Dialect'),
+        key="translation_direction"
     )
 
-    if direction == 'Local Dialect → Standard English':
-        input_label = "Enter the local phrase you want to translate:"
-        source_db = phrases_db
-        not_found_message = "Sorry, I don't know that one yet! You can add it in the 'Contribute' mode."
-    else: # English to Local
-        input_label = "Enter the Standard English phrase you want to translate:"
-        english_to_local_db = {v.lower(): k for k, v in phrases_db.items()}
-        source_db = english_to_local_db
-        not_found_message = "Sorry, no local equivalent found. Feel free to contribute one!"
+    # --- VOICE-TO-TEXT RECORDING ---
+    st.markdown("##### Record your phrase:")
+    audio_bytes = audio_recorder(
+        text="", # No text label on the button
+        icon_size="2x",
+        pause_threshold=2.0,
+    )
+    
+    if audio_bytes:
+        with st.spinner("Transcribing your phrase..."):
+            transcribed_text = transcribe_audio(audio_bytes)
+            if transcribed_text:
+                st.session_state.text_input = transcribed_text
+                st.session_state.is_voice_input = True
+                st.session_state.audio_bytes = audio_bytes
+                st.success("Transcription complete. Press 'Translate' below.")
+            else:
+                st.error("Transcription failed. Please try again.")
 
-    user_input = st.text_input(input_label, placeholder="Type a phrase here...")
+    # --- TEXT INPUT AND TRANSLATION ---
+    st.markdown("##### Or type it here:")
+    user_input = st.text_input(
+        "Enter phrase:",
+        placeholder="Type or record a phrase...",
+        key="text_input",
+        label_visibility="collapsed"
+    )
 
     if st.button("Translate", use_container_width=True, type="primary"):
-        if user_input:
-            query = user_input.strip().lower()
+        if st.session_state.text_input:
+            query = st.session_state.text_input.strip().lower()
+
+            if direction == 'Local Dialect → Standard English':
+                source_db = phrases_db
+                not_found_message = "Sorry, I don't know that one yet! You can add it in the 'Contribute' mode."
+            else:
+                english_to_local_db = {v.lower(): k for k, v in phrases_db.items()}
+                source_db = english_to_local_db
+                not_found_message = "Sorry, no local equivalent found. Feel free to contribute one!"
+
             result = source_db.get(query, not_found_message)
             
             st.subheader("Translation:")
             st.success(f"**{result}**")
 
+            # Text-to-Speech for the result
             if result != not_found_message:
-                st.subheader("Listen to the Translation:")
-                audio_bytes = text_to_speech(result)
-                if audio_bytes:
-                    st.audio(audio_bytes, format="audio/mp3")
+                tts_audio = text_to_speech(result)
+                if tts_audio:
+                    st.audio(tts_audio, format="audio/mp3")
+
+            # --- GEOLOCATION AND STORAGE FOR VOICE INPUTS ---
+            if st.session_state.get('is_voice_input', False) and result != not_found_message:
+                st.subheader("📍 Geolocation & Storage")
+                location = streamlit_geolocation()
+                
+                geo_data = {"latitude": None, "longitude": None}
+                if location and location.get('latitude'):
+                    geo_data['latitude'] = location['latitude']
+                    geo_data['longitude'] = location['longitude']
+                    st.write(f"Location captured: Lat {geo_data['latitude']}, Lon {geo_data['longitude']}")
+                else:
+                    st.warning("Could not retrieve location. Please allow location access in your browser to log it.")
+                
+                # Log the voice translation details
+                log_voice_translation(
+                    audio_bytes=st.session_state.audio_bytes,
+                    original_text=query,
+                    translated_text=result,
+                    geolocation=geo_data
+                )
+
+            # Reset voice input flag after processing
+            st.session_state.is_voice_input = False
+            st.session_state.audio_bytes = None
+
         else:
-            st.warning("Please enter a phrase to translate.")
+            st.warning("Please enter or record a phrase to translate.")
 
 # --- Mode 2: Crowdsourcing / Contribution ---
 elif app_mode == 'Contribute a New Phrase':
@@ -188,84 +267,9 @@ elif app_mode == 'Contribute a New Phrase':
             else:
                 st.error("Please fill in both fields before submitting.")
 
-# --- Mode 3: Record and Contribute ---
-elif app_mode == 'Record and Contribute':
-    st.header("🎤 Record a Phrase")
-    st.info("Contribute by recording a phrase. We'll transcribe it and generate a title and description.", icon="🗣️")
-
-    audio_bytes = audio_recorder(
-        text="Click to Record",
-        recording_color="#e8b62c",
-        neutral_color="#6a6a6a",
-        icon_name="microphone",
-        pause_threshold=2.0,
-    )
-
-    if audio_bytes:
-        st.audio(audio_bytes, format="audio/wav")
-
-        if st.button("Process Recording", use_container_width=True, type="primary"):
-            with st.spinner("Transcribing audio..."):
-                transcribed_text = transcribe_audio(audio_bytes)
-
-            if transcribed_text:
-                st.subheader("Transcription:")
-                st.write(transcribed_text)
-
-                with st.spinner("Generating title and description..."):
-                    title, description = summarize_text_for_title_desc(transcribed_text)
-
-                if title and description:
-                    st.subheader("Generated Title:")
-                    st.write(title)
-                    st.subheader("Generated Description:")
-                    st.write(description)
-                    
-                    st.subheader("Get Geolocation")
-                    location = streamlit_geolocation()
-                    if location and location.get('latitude'):
-                        st.success(f"Location captured: Latitude {location['latitude']}, Longitude {location['longitude']}")
-
-                        if st.button("Save Contribution", use_container_width=True):
-                            # Save the audio file
-                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                            audio_filename = f"{timestamp}.wav"
-                            audio_filepath = os.path.join(AUDIO_DIR, audio_filename)
-                            with open(audio_filepath, "wb") as f:
-                                f.write(audio_bytes)
-
-                            # Save metadata
-                            contribution_id = f"contribution_{len(contributions_db) + 1}"
-                            contributions_db[contribution_id] = {
-                                "title": title,
-                                "description": description,
-                                "transcribed_text": transcribed_text,
-                                "geolocation": {
-                                    "latitude": location['latitude'],
-                                    "longitude": location['longitude']
-                                },
-                                "audio_file": audio_filepath,
-                                "timestamp": timestamp
-                            }
-                            save_database(contributions_db, CONTRIBUTIONS_FILE)
-                            st.success("Your contribution has been saved!")
-                            st.balloons()
-                    else:
-                        st.warning("Could not retrieve location. Please allow location access in your browser.")
-                else:
-                    st.error("Could not generate a title and description.")
-            else:
-                st.error("Transcription failed.")
-
 # --- Displaying the Raw Data (Optional) ---
-with st.expander("🧐 See all known phrases (the current database)"):
-    if phrases_db:
-        st.json(phrases_db)
-    else:
-        st.write("The phrase database is currently empty. Contribute a phrase to get started!")
+with st.expander("🧐 See all known phrases (the translation database)"):
+    st.json(load_database(DB_FILE))
 
-with st.expander("🎙️ See all voice contributions"):
-    if contributions_db:
-        st.json(contributions_db)
-    else:
-        st.write("The voice contribution database is currently empty. Record a contribution to get started!")
+with st.expander("🎙️ See all voice translation logs"):
+    st.json(load_database(TRANSLATION_LOG_FILE))
